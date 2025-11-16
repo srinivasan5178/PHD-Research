@@ -1,0 +1,641 @@
+# ============================================================
+# Multi-Hazard Fusion + P-wave Early Warning + Autoencoder + Random Forest
+# EQ (P-wave metadata) + Flood (rainfall)
+# Train/Test Split (70/30) + Flask frontend for manual input + Metrics
+# Author: s sri | Updated: AE+RF combined decision + Disaster Type output
+# ============================================================
+
+import os
+import re
+import ast
+import json
+import numpy as np
+import pandas as pd
+from scipy.signal import butter, filtfilt
+
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.decomposition import PCA
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, precision_score, recall_score, f1_score, accuracy_score
+from sklearn.ensemble import RandomForestClassifier
+
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks
+
+from flask import Flask, render_template_string, request, jsonify
+
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+# -----------------------------
+# File paths (update if needed)
+# -----------------------------
+P_wave_earthquake_path = r"C:\Users\srini\Desktop\Project\Baladealgorithm\Dataset\Dataset\Dataset\Dataset_earth_land\P-wave-Eartquakes-.csv"
+flood_path             = r"C:\Users\srini\Desktop\Project\Baladealgorithm\Dataset\Dataset\Dataset\Dataset_earth_land\flood_risk_dataset_india.csv"
+
+# -----------------------------
+# Hyper / weights
+# -----------------------------
+PWEWI_WEIGHT = 2.5
+LOWFREQ_WEIGHT = 2.0
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def safe_read_csv(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"File not found: {path}")
+    return pd.read_csv(path)
+
+def parse_array_strings(df):
+    def parse_val(x):
+        if isinstance(x, str):
+            try:
+                txt = x.strip()
+                if txt.startswith('[') and txt.endswith(']'):
+                    try:
+                        arr = ast.literal_eval(txt)
+                    except Exception:
+                        nums = re.findall(r"[-+]?\d*\.\d+|\d+", txt)
+                        arr = [float(n) for n in nums]
+                    if isinstance(arr, (list, tuple, np.ndarray)):
+                        arr = np.array(arr, dtype=float)
+                        return float(np.mean(arr))
+                nums = re.findall(r"[-+]?\d*\.\d+|\d+", x)
+                if nums:
+                    return float(nums[0])
+                return float(txt)
+            except Exception:
+                return np.nan
+        return x
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            df[col] = df[col].apply(parse_val)
+    return df
+
+def bandpass_filter(data, lowcut, highcut, fs=250, order=4):
+    nyq = 0.5 * fs
+    low = max(lowcut / nyq, 1e-12)
+    high = min(highcut / nyq, 0.999999)
+    b, a = butter(order, [low, high], btype='band')
+    return filtfilt(b, a, data)
+
+def compute_p_wave_energy_proxy(df):
+    # returns df with P_Wave_Energy_Proxy, LowFreq_Energy, P_S_gap
+    df = parse_array_strings(df.copy())
+    required = {'p_arrival_sample','s_arrival_sample','p_travel_sec'}
+    if not required.issubset(df.columns):
+        df['P_Wave_Energy_Proxy'] = 0.0
+        df['LowFreq_Energy'] = 0.0
+        df['P_S_gap'] = np.nan
+        return df
+
+    df['P_S_gap'] = df['s_arrival_sample'].astype(float) - df['p_arrival_sample'].astype(float)
+    snr = df['snr_db'].astype(float) if 'snr_db' in df.columns else pd.Series(np.ones(len(df)))
+    df['P_Wave_Energy_Proxy'] = (snr * df['P_S_gap']) / (df['p_travel_sec'].astype(float) + 1.0)
+
+    signal = df['snr_db'].astype(float).values if 'snr_db' in df.columns else df['p_travel_sec'].astype(float).values
+    try:
+        if len(signal) > 3:
+            filtered = bandpass_filter(signal, 0.5, 5.0, fs=250)
+            df['LowFreq_Energy'] = np.mean(filtered**2)
+        else:
+            df['LowFreq_Energy'] = np.mean(signal**2)
+    except Exception:
+        df['LowFreq_Energy'] = np.mean(signal**2)
+
+    df[['P_Wave_Energy_Proxy','LowFreq_Energy']] = df[['P_Wave_Energy_Proxy','LowFreq_Energy']].replace([np.inf,-np.inf],0).fillna(0)
+    return df
+
+def safe_clean_numeric_dataframe(df, name):
+    df = df.copy()
+    df = parse_array_strings(df)
+    for c in df.columns:
+        if not pd.api.types.is_numeric_dtype(df[c]):
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    for c in df.columns:
+        df[c] = df[c].fillna(df[c].mean() if not df[c].isna().all() else 0.0)
+    print(f"✅ Cleaned {name} numeric ({df.shape[1]} cols, {df.shape[0]} rows)")
+    return df
+
+def run_pca_safe(df, n_components=3):
+    if df.shape[1]==0 or df.shape[0]==0:
+        return None, np.zeros((df.shape[0], min(n_components,1))), None
+    scaler = StandardScaler()
+    X = scaler.fit_transform(df)
+    n_comp = min(n_components, X.shape[1])
+    pca = PCA(n_components=n_comp)
+    Xp = pca.fit_transform(X)
+    if Xp.shape[1] < 2:
+        Xp = np.hstack([Xp, np.zeros((Xp.shape[0], 2 - Xp.shape[1]))])
+    return pca, Xp, scaler
+
+def combine_advanced(rf_pred, ae_anom):
+    """
+    Decision fusion rules:
+      - If RF says HIGH -> HIGH
+      - If RF says MEDIUM and AE anomaly -> HIGH
+      - If RF says LOW and AE anomaly -> MEDIUM
+      - Else -> RF prediction
+    """
+    if rf_pred == "HIGH":
+        return "HIGH"
+    if rf_pred == "MEDIUM" and ae_anom:
+        return "HIGH"
+    if rf_pred == "LOW" and ae_anom:
+        return "MEDIUM"
+    return rf_pred
+
+# -----------------------------
+# Disaster type decision logic
+# -----------------------------
+def classify_disaster(rf_risk, ae_anom, pwewi, lowfreq, rainfall):
+    """
+    Return one of: 'EARTHQUAKE', 'FLOOD', 'NORMAL'
+    Simple rule-based logic combining RF, AE, and raw features.
+    Thresholds chosen conservatively; tune them based on your data.
+    """
+    # quick numeric safety
+    try:
+        pwewi = float(pwewi)
+    except Exception:
+        pwewi = 0.0
+    try:
+        lowfreq = float(lowfreq)
+    except Exception:
+        lowfreq = 0.0
+    try:
+        rainfall = float(rainfall)
+    except Exception:
+        rainfall = 0.0
+
+    # thresholds (you should tune these on validation data)
+    PWEWI_EQ_THRESH = 3.0      # large PWEWI suggests EQ (example)
+    LOWFREQ_EQ_THRESH = 8000  # high low-frequency energy -> EQ
+    RAINFALL_FLOOD_THRESH = 50
+    RAINFALL_MEDIUM_THRESH = 30
+
+    # If RF already implies HIGH (earthquake-prone label), prefer earthquake when lowfreq or PWEWI high
+    if rf_risk == 'HIGH':
+        if lowfreq >= LOWFREQ_EQ_THRESH or pwewi >= PWEWI_EQ_THRESH:
+            return 'EARTHQUAKE'
+        # If rainfall is extremely high, it might be flood despite RF high
+        if rainfall >= RAINFALL_FLOOD_THRESH:
+            return 'FLOOD'
+        # AE anomaly + moderate lowfreq -> earthquake
+        if ae_anom and lowfreq > (LOWFREQ_EQ_THRESH/2):
+            return 'EARTHQUAKE'
+        return 'EARTHQUAKE'
+
+    # RF MEDIUM -> usually flood-driven label in your design
+    if rf_risk == 'MEDIUM':
+        if rainfall >= RAINFALL_MEDIUM_THRESH:
+            return 'FLOOD'
+        if ae_anom and lowfreq > LOWFREQ_EQ_THRESH/2:
+            return 'EARTHQUAKE'
+        return 'FLOOD'
+
+    # RF LOW -> normal unless AE anomaly or strong signals
+    if ae_anom:
+        if lowfreq >= LOWFREQ_EQ_THRESH:
+            return 'EARTHQUAKE'
+        if rainfall >= RAINFALL_MEDIUM_THRESH:
+            return 'FLOOD'
+        # uncertain anomaly -> mark as EARTHQUAKE by default
+        return 'EARTHQUAKE'
+
+    # default
+    if rainfall >= RAINFALL_FLOOD_THRESH:
+        return 'FLOOD'
+    return 'NORMAL'
+
+# -----------------------------
+# Load & preprocess datasets
+# -----------------------------
+print("Loading datasets...")
+df_pw = safe_read_csv(P_wave_earthquake_path)
+df_fl = safe_read_csv(flood_path)
+print("✅ Datasets loaded")
+
+# compute P-wave proxies and standardize PWEWI
+df_pw = compute_p_wave_energy_proxy(df_pw)
+vals = np.array(df_pw['P_Wave_Energy_Proxy'].astype(float).values).reshape(-1,1)
+df_pw['PWEWI'] = 0.0 if np.nanstd(vals)==0 else StandardScaler().fit_transform(vals).ravel()
+
+# numeric cleaning for PCA
+eq_num = safe_clean_numeric_dataframe(df_pw.select_dtypes(include=[np.number]), 'EQ')
+fl_num = safe_clean_numeric_dataframe(df_fl.select_dtypes(include=[np.number]), 'FL')
+
+if 'PWEWI' not in eq_num.columns:
+    eq_num['PWEWI'] = df_pw['PWEWI']
+
+# PCA + scalers (return scalers to reuse for manual input)
+pca_eq, eq_pca, scaler_eq = run_pca_safe(eq_num, 3)
+pca_fl, fl_pca, scaler_fl = run_pca_safe(fl_num, 3)
+
+# Fusion: align number of rows
+n = min(eq_pca.shape[0], fl_pca.shape[0])
+fusion_mat = np.hstack([eq_pca[:n,:2], fl_pca[:n,:2]])
+fusion_cols = ['EQ_PC1','EQ_PC2','FL_PC1','FL_PC2']
+fusion_df = pd.DataFrame(fusion_mat, columns=fusion_cols)
+
+fusion_df['PWEWI'] = df_pw['PWEWI'].reset_index(drop=True)[:n].fillna(0.0)
+fusion_df['LowFreq_Energy'] = df_pw['LowFreq_Energy'].reset_index(drop=True)[:n].fillna(0.0)
+
+# Weighted features used for RF training
+fusion_df['PWEWI_w'] = fusion_df['PWEWI'] * PWEWI_WEIGHT
+fusion_df['LowFreq_Energy_w'] = fusion_df['LowFreq_Energy'] * LOWFREQ_WEIGHT
+ae_features = fusion_cols + ['PWEWI_w','LowFreq_Energy_w']
+
+# -----------------------------
+# Create combined labels using PWEWI and flood rainfall (if available)
+# -----------------------------
+use_rainfall = 'rainfall' in df_fl.columns
+
+if use_rainfall:
+    rainfall_series = df_fl['rainfall'].reset_index(drop=True)[:n].fillna(0.0).astype(float)
+    p66 = np.nanpercentile(fusion_df['PWEWI'], 66)
+    r66 = np.nanpercentile(rainfall_series, 66)
+    def label_row(pw, rf):
+        if pw > p66:
+            return 'HIGH'
+        elif rf > r66:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
+    y_labels = [label_row(p, r) for p, r in zip(fusion_df['PWEWI'].values, rainfall_series.values)]
+else:
+    p33, p66 = np.nanpercentile(fusion_df['PWEWI'], [33,66])
+    def label_pw(p):
+        if p > p66:
+            return 'HIGH'
+        elif p > p33:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
+    y_labels = fusion_df['PWEWI'].apply(label_pw).values
+
+fusion_df['Risk_Label'] = y_labels
+
+# -----------------------------
+# Train/test split
+# -----------------------------
+X = fusion_df[ae_features].values
+y = fusion_df['Risk_Label'].values
+
+X_train, X_test, y_train, y_test, idx_train, idx_test = train_test_split(
+    X, y, fusion_df.index, test_size=0.3, random_state=42, stratify=y
+)
+
+# -----------------------------
+# Random Forest Classifier (train)
+# -----------------------------
+rf_clf = RandomForestClassifier(n_estimators=300, max_depth=8, random_state=42, class_weight='balanced')
+rf_clf.fit(X_train, y_train)
+
+# test predictions
+y_test_pred = rf_clf.predict(X_test)
+fusion_df.loc[idx_test, 'Risk_Pred'] = y_test_pred
+
+# -----------------------------
+# Metrics (RF)
+# -----------------------------
+report = classification_report(y_test, y_test_pred, digits=4)
+precision_w = precision_score(y_test, y_test_pred, average='weighted')
+recall_w = recall_score(y_test, y_test_pred, average='weighted')
+f1_w = f1_score(y_test, y_test_pred, average='weighted')
+accuracy = accuracy_score(y_test, y_test_pred)
+
+print("📊 Test Set Metrics (Random Forest):")
+print(report)
+print(f"Accuracy: {accuracy:.4f}, Precision(w): {precision_w:.4f}, Recall(w): {recall_w:.4f}, F1(w): {f1_w:.4f}")
+
+# -----------------------------
+# Save results safely
+# -----------------------------
+try:
+    fusion_df.to_csv("multi_hazard_fusion_rf.csv", index=False)
+    print("✅ Saved multi_hazard_fusion_rf.csv")
+except Exception as e:
+    print("⚠️ Could not save CSV:", e)
+
+# -----------------------------
+# Autoencoder (optional)
+# -----------------------------
+ae = None
+ae_scaler = None
+ae_threshold = None
+
+ae_features_ae = fusion_cols + ['PWEWI','LowFreq_Energy']
+try:
+    X_ae = fusion_df[ae_features_ae].values
+    ae_scaler = MinMaxScaler()
+    X_scaled = ae_scaler.fit_transform(X_ae)
+    n_train_ae = max(1, int(0.8 * len(X_scaled)))
+    X_train_ae = X_scaled[:n_train_ae]
+    X_val_ae = X_scaled[n_train_ae:] if n_train_ae < len(X_scaled) else X_scaled
+
+    input_dim = X_train_ae.shape[1]
+    encoding_dim = max(2, input_dim // 3)
+    ae_input = layers.Input(shape=(input_dim,))
+    encoded = layers.Dense(encoding_dim*2, activation='relu')(ae_input)
+    encoded = layers.Dense(encoding_dim, activation='relu')(encoded)
+    decoded = layers.Dense(encoding_dim*2, activation='relu')(encoded)
+    decoded = layers.Dense(input_dim, activation='linear')(decoded)
+    ae = models.Model(ae_input, decoded)
+    ae.compile(optimizer='adam', loss='mse')
+    es = callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+    ae.fit(X_train_ae, X_train_ae, validation_data=(X_val_ae, X_val_ae), epochs=50, batch_size=32, callbacks=[es], verbose=0)
+
+    X_pred = ae.predict(X_scaled)
+    recon_err = np.mean((X_scaled - X_pred)**2, axis=1)
+    val_pred = ae.predict(X_val_ae)
+    val_err = np.mean((X_val_ae - val_pred)**2, axis=1)
+    ae_threshold = np.mean(val_err) + 3*np.std(val_err) if len(val_err) > 0 else np.mean(recon_err) + 3*np.std(recon_err)
+    fusion_df['AE_Reconstruction_Error'] = recon_err
+    fusion_df['AE_Anomaly'] = fusion_df['AE_Reconstruction_Error'] > ae_threshold
+    try:
+        fusion_df.to_csv("multi_hazard_fusion_rf_autoencoder.csv", index=False)
+    except Exception as e:
+        print("⚠️ Could not save autoencoder CSV:", e)
+    print("✅ Autoencoder trained and results saved (if permitted). AE threshold:", ae_threshold)
+except Exception as ex:
+    print("⚠️ Autoencoder skipped due to error:", ex)
+    fusion_df['AE_Reconstruction_Error'] = 0.0
+    fusion_df['AE_Anomaly'] = False
+    ae = None
+    ae_scaler = None
+    ae_threshold = None
+
+# -----------------------------
+# Combine AE + RF predictions and evaluate
+# -----------------------------
+if 'Risk_Pred' not in fusion_df.columns:
+    fusion_df['Risk_Pred'] = rf_clf.predict(fusion_df[ae_features].values)
+
+fusion_df['Combined_Pred'] = fusion_df.apply(lambda r: combine_advanced(r['Risk_Pred'], bool(r.get('AE_Anomaly', False))), axis=1)
+
+combined_test_preds = fusion_df.loc[idx_test, 'Combined_Pred'].values
+combined_report = classification_report(y_test, combined_test_preds, digits=4)
+combined_precision = precision_score(y_test, combined_test_preds, average='weighted')
+combined_recall = recall_score(y_test, combined_test_preds, average='weighted')
+combined_f1 = f1_score(y_test, combined_test_preds, average='weighted')
+combined_accuracy = accuracy_score(y_test, combined_test_preds)
+
+print("📊 Test Set Metrics (Combined AE+RF):")
+print(combined_report)
+print(f"Combined Accuracy: {combined_accuracy:.4f}, Precision(w): {combined_precision:.4f}, Recall(w): {combined_recall:.4f}, F1(w): {combined_f1:.4f}")
+
+# -----------------------------
+# Save combined results
+# -----------------------------
+try:
+    fusion_df.to_csv("multi_hazard_fusion_rf_combined.csv", index=False)
+    print("✅ Saved multi_hazard_fusion_rf_combined.csv")
+except Exception as e:
+    print("⚠️ Could not save combined CSV:", e)
+
+# -----------------------------
+# Manual prediction helper (used by Flask)
+# -----------------------------
+def manual_input_predict_disaster(input_dict):
+    """
+    Accepts a dict with P-wave inputs (p_arrival_sample, s_arrival_sample, p_travel_sec, snr_db)
+    and optionally 'rainfall'. Returns:
+      risk_level_rf, ae_anomaly (bool), combined_risk, is_disaster (YES/NO),
+      PWEWI_val, LowFreq_val, rainfall_val, confidence
+    """
+    # create dataframe from input
+    df_input = pd.DataFrame([input_dict])
+    df_input = compute_p_wave_energy_proxy(df_input)
+    df_numeric = safe_clean_numeric_dataframe(df_input.select_dtypes(include=[np.number]), 'Manual Input')
+
+    # align columns for PCA transform (use same columns as eq_num and fl_num)
+    def align_cols(df, all_cols):
+        for c in all_cols:
+            if c not in df.columns:
+                df[c] = 0.0
+        return df[all_cols]
+
+    eq_input = align_cols(df_numeric.copy(), eq_num.columns)
+    fl_input = align_cols(df_numeric.copy(), fl_num.columns)
+
+    # project with training scalers+pca (fallback to zeros when failing)
+    try:
+        X_scaled_eq = scaler_eq.transform(eq_input.values)
+        Xp_eq = pca_eq.transform(X_scaled_eq)[:, :2]
+        if Xp_eq.shape[1] < 2:
+            Xp_eq = np.hstack([Xp_eq, np.zeros((Xp_eq.shape[0], 2 - Xp_eq.shape[1]))])
+    except Exception:
+        Xp_eq = np.zeros((eq_input.shape[0], 2))
+
+    try:
+        X_scaled_fl = scaler_fl.transform(fl_input.values)
+        Xp_fl = pca_fl.transform(X_scaled_fl)[:, :2]
+        if Xp_fl.shape[1] < 2:
+            Xp_fl = np.hstack([Xp_fl, np.zeros((Xp_fl.shape[0], 2 - Xp_fl.shape[1]))])
+    except Exception:
+        Xp_fl = np.zeros((fl_input.shape[0], 2))
+
+    # ensure PWEWI / LowFreq_Energy presence
+    if 'PWEWI' not in df_input.columns:
+        df_input['PWEWI'] = df_input.get('P_Wave_Energy_Proxy', pd.Series([0.0]))
+    if 'LowFreq_Energy' not in df_input.columns:
+        df_input['LowFreq_Energy'] = 0.0
+    PWEWI_w = df_input['PWEWI'].values * PWEWI_WEIGHT
+    LowFreq_w = df_input['LowFreq_Energy'].values * LOWFREQ_WEIGHT
+
+    # construct RF-features array matching training order
+    rf_input = np.hstack([Xp_eq[:, :2], Xp_fl[:, :2], PWEWI_w.reshape(-1, 1), LowFreq_w.reshape(-1, 1)])
+
+    # predict RF
+    try:
+        risk_level_rf = rf_clf.predict(rf_input)[0]
+        probs = rf_clf.predict_proba(rf_input)[0]
+        # map classes to index
+        idx = np.where(rf_clf.classes_ == risk_level_rf)[0]
+        confidence = float(probs[idx[0]]) if len(idx) > 0 else float(np.max(probs))
+    except Exception:
+        risk_level_rf = 'LOW'
+        confidence = 0.0
+
+    # Autoencoder anomaly detection for manual input (if AE trained)
+    ae_anomaly = False
+    try:
+        if (ae is not None) and (ae_scaler is not None) and (ae_threshold is not None):
+            # Build AE input vector (must match ae_features_ae order)
+            ae_vec = []
+            for c in ae_features_ae:
+                ae_vec.append(float(df_input.get(c, pd.Series([0.0])).values[0]))
+            ae_vec = np.array(ae_vec, dtype=float).reshape(1, -1)
+            ae_vec_scaled = ae_scaler.transform(ae_vec)
+            ae_rec = ae.predict(ae_vec_scaled)
+            recon_err = np.mean((ae_vec_scaled - ae_rec)**2, axis=1)[0]
+            ae_anomaly = bool(recon_err > ae_threshold)
+        else:
+            ae_anomaly = False
+            recon_err = 0.0
+    except Exception:
+        ae_anomaly = False
+        recon_err = 0.0
+
+    # combine RF + AE
+    combined_risk = combine_advanced(risk_level_rf, ae_anomaly)
+
+    # classify disaster type using combined info
+    PWEWI_val = float(df_input['PWEWI'].values[0])
+    LowFreq_val = float(df_input['LowFreq_Energy'].values[0])
+    rainfall_val = float(df_input.get('rainfall', pd.Series([0.0])).values[0])
+
+    disaster_type = classify_disaster(risk_level_rf, ae_anomaly, PWEWI_val, LowFreq_val, rainfall_val)
+    is_disaster = "YES" if combined_risk in ['HIGH', 'MEDIUM'] else "NO"
+
+    return {
+        "risk_level_rf": risk_level_rf,
+        "ae_anomaly": ae_anomaly,
+        "combined_risk": combined_risk,
+        "disaster_type": disaster_type,
+        "is_disaster": is_disaster,
+        "PWEWI": PWEWI_val,
+        "LowFreq_Energy": LowFreq_val,
+        "rainfall": rainfall_val,
+        "confidence": confidence,
+        "recon_error": float(recon_err) if 'recon_err' in locals() else 0.0
+    }
+
+# -----------------------------
+# Flask App + frontend (Jinja template)
+# -----------------------------
+app = Flask(__name__)
+
+HTML_TEMPLATE = """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Multi-Hazard Disaster Prediction</title>
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+  <style>
+    body { background: #f5f7fa; font-family:'Segoe UI',sans-serif; }
+    .badge-high{background:#dc3545;color:#fff;padding:.4rem .6rem;border-radius:.4rem}
+    .badge-medium{background:#fd7e14;color:#fff;padding:.4rem .6rem;border-radius:.4rem}
+    .badge-low{background:#28a745;color:#fff;padding:.4rem .6rem;border-radius:.4rem}
+  </style>
+</head>
+<body>
+<div class="container mt-5">
+  <h2 class="text-center mb-4">🌐 Multi-Hazard Disaster Prediction</h2>
+
+  <div class="card p-4 mb-4">
+    <h5>Model Test Metrics</h5>
+    <div class="row text-center mt-3">
+      <div class="col"><strong>RF Accuracy</strong><div>{{ accuracy }}</div></div>
+      <div class="col"><strong>RF Precision (w)</strong><div>{{ precision_w }}</div></div>
+      <div class="col"><strong>RF Recall (w)</strong><div>{{ recall_w }}</div></div>
+      <div class="col"><strong>RF F1 (w)</strong><div>{{ f1_w }}</div></div>
+    </div>
+    <div class="row text-center mt-3">
+      <div class="col"><strong>Combined Accuracy</strong><div>{{ combined_accuracy }}</div></div>
+      <div class="col"><strong>Combined Precision (w)</strong><div>{{ combined_precision }}</div></div>
+      <div class="col"><strong>Combined Recall (w)</strong><div>{{ combined_recall }}</div></div>
+      <div class="col"><strong>Combined F1 (w)</strong><div>{{ combined_f1 }}</div></div>
+    </div>
+  </div>
+
+  <div class="card p-4">
+    <h5>Manual Prediction Input</h5>
+    <form id="predictForm">
+      <div class="row">
+        <div class="col-md-6 mb-3"><label>P Arrival Sample</label><input id="p_arrival_sample" class="form-control" type="number" step="any" required></div>
+        <div class="col-md-6 mb-3"><label>S Arrival Sample</label><input id="s_arrival_sample" class="form-control" type="number" step="any" required></div>
+        <div class="col-md-6 mb-3"><label>P Travel Time (sec)</label><input id="p_travel_sec" class="form-control" type="number" step="any" required></div>
+        <div class="col-md-6 mb-3"><label>SNR (dB)</label><input id="snr_db" class="form-control" type="number" step="any" required></div>
+        <div class="col-md-6 mb-3"><label>Rainfall (mm)</label><input id="rainfall" class="form-control" type="number" step="any"></div>
+      </div>
+      <button class="btn btn-primary w-100" type="submit">Predict Disaster</button>
+    </form>
+
+    <div id="result" class="mt-3"></div>
+  </div>
+</div>
+
+<script>
+function riskBadge(level){
+  if(level==='HIGH') return '<span class="badge-high">HIGH</span>';
+  if(level==='MEDIUM') return '<span class="badge-medium">MEDIUM</span>';
+  return '<span class="badge-low">LOW</span>';
+}
+
+document.getElementById('predictForm').addEventListener('submit', async function(e){
+  e.preventDefault();
+  const data = {
+    p_arrival_sample: parseFloat(document.getElementById('p_arrival_sample').value) || 0,
+    s_arrival_sample: parseFloat(document.getElementById('s_arrival_sample').value) || 0,
+    p_travel_sec: parseFloat(document.getElementById('p_travel_sec').value) || 0,
+    snr_db: parseFloat(document.getElementById('snr_db').value) || 0,
+    rainfall: document.getElementById('rainfall').value ? parseFloat(document.getElementById('rainfall').value) : 0
+  };
+  try {
+    const resp = await axios.post('/predict', data);
+    if(resp.data.error){
+      document.getElementById('result').innerHTML = '<div class="text-danger">Error: ' + resp.data.error + '</div>';
+    } else {
+      const r = resp.data;
+      document.getElementById('result').innerHTML = `<div class="alert alert-info">
+        <b>RF Risk (raw):</b> ${riskBadge(r.risk_level_rf)}<br>
+        <b>AE Anomaly:</b> ${r.ae_anomaly ? '<strong style="color:#dc3545">YES</strong>' : 'NO'}<br>
+        <b>Combined Risk:</b> ${riskBadge(r.combined_risk)}<br>
+        <b>Disaster?</b> ${r.is_disaster}<br>
+        <b>Disaster Type:</b> <strong>${r.disaster_type}</strong><br>
+        <b>RF Confidence:</b> ${r.confidence.toFixed(4)}<br>
+        <b>AE Recon Error:</b> ${r.recon_error.toFixed(6)}<br>
+        <b>PWEWI:</b> ${r.PWEWI.toFixed(4)}, <b>LowFreq:</b> ${r.LowFreq_Energy.toFixed(4)}, <b>rainfall:</b> ${r.rainfall}
+      </div>`;
+    }
+  } catch(err){
+    document.getElementById('result').innerHTML = '<div class="text-danger">Request failed</div>';
+  }
+});
+</script>
+</body>
+</html>
+"""
+
+@app.route("/")
+def home():
+    return render_template_string(HTML_TEMPLATE,
+                                  accuracy=f"{accuracy:.4f}",
+                                  precision_w=f"{precision_w:.4f}",
+                                  recall_w=f"{recall_w:.4f}",
+                                  f1_w=f"{f1_w:.4f}",
+                                  combined_accuracy=f"{combined_accuracy:.4f}",
+                                  combined_precision=f"{combined_precision:.4f}",
+                                  combined_recall=f"{combined_recall:.4f}",
+                                  combined_f1=f"{combined_f1:.4f}"
+                                  )
+
+@app.route("/predict", methods=["POST"])
+def predict():
+    try:
+        data = request.json or {}
+        out = manual_input_predict_disaster(data)
+        # Map to keys used in front-end
+        return jsonify({
+            "risk_level_rf": out["risk_level_rf"],
+            "ae_anomaly": out["ae_anomaly"],
+            "combined_risk": out["combined_risk"],
+            "disaster_type": out["disaster_type"],
+            "is_disaster": out["is_disaster"],
+            "PWEWI": out["PWEWI"],
+            "LowFreq_Energy": out["LowFreq_Energy"],
+            "rainfall": out["rainfall"],
+            "confidence": out["confidence"],
+            "recon_error": out["recon_error"]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+if __name__ == "__main__":
+    # Run on 127.0.0.1:5000
+    app.run(debug=True)
