@@ -1,0 +1,313 @@
+# ============================================================
+# Multi-Hazard Fusion + Enhanced P-wave Early Warning + Autoencoder
+# (EQ [P-wave metadata] + Landslide + Flood + Climate)
+# PCA feature influence + Weighted PCA fusion + KMeans clustering
+# Interactive manual input for disaster prediction
+# Author: s sri | Updated full version
+# ============================================================
+
+import os
+import re
+import ast
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.signal import butter, filtfilt
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, classification_report
+
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks
+
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+# -----------------------------
+# 1) File paths (modify as needed)
+# -----------------------------
+P_wave_earthquake_path = r"C:\Users\srini\Desktop\Project\Baladealgorithm\Dataset\Dataset\Dataset\Dataset_earth_land\P-wave-Eartquakes-.csv"
+landslide_path  = r"C:\Users\srini\Desktop\Project\Baladealgorithm\Dataset\Dataset\Dataset\Dataset_earth_land\landslide_dataset.csv"
+flood_path      = r"C:\Users\srini\Desktop\Project\Baladealgorithm\Dataset\Dataset\Dataset\Dataset_earth_land\flood_risk_dataset_india.csv"
+climate_path    = r"C:\Users\srini\Desktop\Project\Baladealgorithm\Dataset\Dataset\Dataset\Dataset_earth_land\weather.csv"
+
+# -----------------------------
+# 2) Utilities
+# -----------------------------
+def safe_read_csv(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"File not found: {path}")
+    return pd.read_csv(path)
+
+def parse_array_strings(df):
+    """Convert stringified numeric arrays like '[56.7 55.4]' into mean float values"""
+    def parse_val(x):
+        if isinstance(x, str):
+            try:
+                if x.strip().startswith('[') and x.strip().endswith(']'):
+                    arr = ast.literal_eval(x)
+                    if isinstance(arr, (list, tuple, np.ndarray)):
+                        arr = np.array(arr, dtype=float)
+                        return float(np.mean(arr))
+            except Exception:
+                nums = re.findall(r"[-+]?\d*\.\d+|\d+", x)
+                if nums:
+                    return float(np.mean([float(n) for n in nums]))
+                return np.nan
+            try:
+                return float(x)
+            except:
+                return np.nan
+        return x
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            df[col] = df[col].apply(parse_val)
+    return df
+
+def bandpass_filter(data, lowcut, highcut, fs=250, order=4):
+    nyq = 0.5 * fs
+    low = max(lowcut / nyq, 1e-12)
+    high = min(highcut / nyq, 0.999999)
+    b, a = butter(order, [low, high], btype='band')
+    return filtfilt(b, a, data)
+
+def compute_p_wave_energy_proxy(df):
+    df = parse_array_strings(df.copy())
+    required = {'p_arrival_sample','s_arrival_sample','p_travel_sec'}
+    if not required.issubset(df.columns):
+        df['P_Wave_Energy_Proxy'] = 0.0
+        df['LowFreq_Energy'] = 0.0
+        df['P_S_gap'] = np.nan
+        return df
+
+    df['P_S_gap'] = df['s_arrival_sample'].astype(float) - df['p_arrival_sample'].astype(float)
+    snr = df['snr_db'].astype(float) if 'snr_db' in df.columns else 1.0
+    df['P_Wave_Energy_Proxy'] = (snr * df['P_S_gap']) / (df['p_travel_sec'].astype(float)+1)
+
+    signal = df['snr_db'].astype(float).values if 'snr_db' in df.columns else df['p_travel_sec'].astype(float).values
+    try:
+        if len(signal) > 3:
+            filtered = bandpass_filter(signal, 0.5, 5.0, fs=250)
+            df['LowFreq_Energy'] = np.mean(filtered**2)
+        else:
+            df['LowFreq_Energy'] = np.mean(signal**2)
+    except:
+        df['LowFreq_Energy'] = np.mean(signal**2)
+
+    df[['P_Wave_Energy_Proxy','LowFreq_Energy']] = df[['P_Wave_Energy_Proxy','LowFreq_Energy']].replace([np.inf,-np.inf],0).fillna(0)
+    return df
+
+def safe_clean_numeric_dataframe(df, name):
+    df = df.copy()
+    df = parse_array_strings(df)
+    for c in df.columns:
+        if not pd.api.types.is_numeric_dtype(df[c]):
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    for c in df.columns:
+        df[c] = df[c].fillna(df[c].mean() if not df[c].isna().all() else 0.0)
+    print(f"✅ Cleaned {name} numeric ({df.shape[1]} cols, {df.shape[0]} rows)")
+    return df
+
+def top_influential_features_from_pca(pca, df, top_n=5):
+    if pca is None or df.shape[1]==0:
+        return pd.Series(dtype=float)
+    loadings = pd.DataFrame(np.abs(pca.components_.T), index=df.columns, columns=[f'PC{i+1}' for i in range(pca.n_components_)])
+    avg = loadings.mean(axis=1).sort_values(ascending=False)
+    return avg.head(top_n)
+
+def run_pca_safe(df, n_components=3):
+    if df.shape[1]==0 or df.shape[0]==0:
+        return None, np.zeros((df.shape[0], min(n_components,1)))
+    scaler = StandardScaler()
+    X = scaler.fit_transform(df)
+    n_comp = min(n_components, X.shape[1])
+    pca = PCA(n_components=n_comp)
+    Xp = pca.fit_transform(X)
+    if Xp.shape[1]<2:
+        Xp = np.hstack([Xp, np.zeros((Xp.shape[0], 2-Xp.shape[1]))])
+    return pca, Xp
+
+# -----------------------------
+# 3) Load datasets
+# -----------------------------
+print("Loading datasets...")
+df_pw = safe_read_csv(P_wave_earthquake_path)
+df_ls = safe_read_csv(landslide_path)
+df_fl = safe_read_csv(flood_path)
+df_cl = safe_read_csv(climate_path)
+print("✅ Loaded all datasets.")
+
+# -----------------------------
+# 4) P-wave processing
+# -----------------------------
+df_pw = compute_p_wave_energy_proxy(df_pw)
+vals = np.array(df_pw['P_Wave_Energy_Proxy'].astype(float)).reshape(-1,1)
+df_pw['PWEWI'] = 0.0 if np.nanstd(vals)==0 else StandardScaler().fit_transform(vals).ravel()
+
+# -----------------------------
+# 5) Clean numeric data
+# -----------------------------
+eq_num = safe_clean_numeric_dataframe(df_pw.select_dtypes(include=[np.number]), 'EQ')
+ls_num = safe_clean_numeric_dataframe(df_ls.select_dtypes(include=[np.number]), 'LS')
+fl_num = safe_clean_numeric_dataframe(df_fl.select_dtypes(include=[np.number]), 'FL')
+cl_num = safe_clean_numeric_dataframe(df_cl.select_dtypes(include=[np.number]), 'CL')
+
+if 'PWEWI' not in eq_num.columns:
+    eq_num['PWEWI'] = df_pw['PWEWI']
+
+# -----------------------------
+# 6) PCA per hazard
+# -----------------------------
+pca_eq, eq_pca = run_pca_safe(eq_num,3)
+pca_ls, ls_pca = run_pca_safe(ls_num,3)
+pca_fl, fl_pca = run_pca_safe(fl_num,3)
+pca_cl, cl_pca = run_pca_safe(cl_num,3)
+
+# -----------------------------
+# 7) Fusion matrix + clustering
+# -----------------------------
+n = min(eq_pca.shape[0], ls_pca.shape[0], fl_pca.shape[0], cl_pca.shape[0])
+fusion_mat = np.hstack([eq_pca[:n,:2], ls_pca[:n,:2], fl_pca[:n,:2], cl_pca[:n,:2]])
+fusion_cols = ['EQ_PC1','EQ_PC2','LS_PC1','LS_PC2','FL_PC1','FL_PC2','CL_PC1','CL_PC2']
+fusion_df = pd.DataFrame(fusion_mat, columns=fusion_cols)
+fusion_df['PWEWI'] = df_pw['PWEWI'].reset_index(drop=True)[:n].fillna(0.0)
+fusion_df['LowFreq_Energy'] = df_pw['LowFreq_Energy'].reset_index(drop=True)[:n].fillna(0.0)
+
+kmeans = KMeans(n_clusters=3, random_state=42)
+fusion_df['Risk_Cluster'] = kmeans.fit_predict(fusion_df)
+fusion_df['MHR_Index'] = fusion_df[fusion_cols+['PWEWI','LowFreq_Energy']].mean(axis=1)
+cluster_means = fusion_df.groupby('Risk_Cluster')['MHR_Index'].mean().sort_values(ascending=False)
+cluster_to_label = {int(cid): label for cid,label in zip(cluster_means.index,['HIGH','MEDIUM','LOW'])}
+fusion_df['Risk_Level'] = fusion_df['Risk_Cluster'].map(cluster_to_label)
+
+fusion_df.to_csv("multi_hazard_fusion_final.csv", index=False)
+print("✅ Fusion + clustering saved to multi_hazard_fusion_final.csv")
+
+# -----------------------------
+# 8) Autoencoder for anomaly detection
+# -----------------------------
+ae_features = fusion_cols + ['PWEWI','LowFreq_Energy']
+X = fusion_df[ae_features].values
+ae_scaler = MinMaxScaler()
+X_scaled = ae_scaler.fit_transform(X)
+n_train = int(0.8*len(X_scaled))
+X_train, X_val = X_scaled[:n_train], X_scaled[n_train:]
+
+input_dim = X_train.shape[1]
+encoding_dim = max(2, input_dim//3)
+ae_input = layers.Input(shape=(input_dim,))
+encoded = layers.Dense(encoding_dim*2, activation='relu')(ae_input)
+encoded = layers.Dense(encoding_dim, activation='relu')(encoded)
+decoded = layers.Dense(encoding_dim*2, activation='relu')(encoded)
+decoded = layers.Dense(input_dim, activation='linear')(decoded)
+ae = models.Model(ae_input, decoded)
+ae.compile(optimizer='adam', loss='mse')
+es = callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+ae.fit(X_train, X_train, validation_data=(X_val,X_val), epochs=50, batch_size=32, callbacks=[es], verbose=0)
+
+X_pred = ae.predict(X_scaled)
+recon_err = np.mean((X_scaled-X_pred)**2, axis=1)
+val_pred = ae.predict(X_val)
+val_err = np.mean((X_val-val_pred)**2, axis=1)
+ae_threshold = np.mean(val_err)+3*np.std(val_err)
+
+fusion_df['AE_Reconstruction_Error'] = recon_err
+fusion_df['AE_Anomaly'] = fusion_df['AE_Reconstruction_Error']>ae_threshold
+fusion_df.to_csv("multi_hazard_fusion_with_autoencoder.csv", index=False)
+print("✅ Fusion + autoencoder saved to multi_hazard_fusion_with_autoencoder.csv")
+
+# -----------------------------
+# 9) Manual Input Prediction Function
+# -----------------------------
+def manual_input_predict_disaster(input_dict):
+    df_input = pd.DataFrame([input_dict])
+    df_input = compute_p_wave_energy_proxy(df_input)
+    df_input = safe_clean_numeric_dataframe(df_input.select_dtypes(include=[np.number]), 'Manual Input')
+
+    def align_cols(df, all_cols):
+        for c in all_cols:
+            if c not in df.columns:
+                df[c] = 0.0
+        return df[all_cols]
+
+    eq_input = align_cols(df_input, eq_num.columns)
+    ls_input = align_cols(df_input, ls_num.columns)
+    fl_input = align_cols(df_input, fl_num.columns)
+    cl_input = align_cols(df_input, cl_num.columns)
+
+    pcs = []
+    for pca, df_sub in zip([pca_eq,pca_ls,pca_fl,pca_cl],[eq_input,ls_input,fl_input,cl_input]):
+        if pca is not None and df_sub.shape[1]>0:
+            X_scaled = StandardScaler().fit_transform(df_sub.values)
+            Xp = pca.transform(X_scaled)
+            if Xp.shape[1]<2:
+                Xp = np.hstack([Xp, np.zeros((Xp.shape[0],2-Xp.shape[1]))])
+        else:
+            Xp = np.zeros((df_sub.shape[0],2))
+        pcs.append(Xp[:,:2])
+
+    fusion_input = np.hstack(pcs + [df_input[['PWEWI','LowFreq_Energy']].values])
+    cluster_pred = kmeans.predict(fusion_input)[0]
+    cluster_means = {cid:fusion_df[fusion_df['Risk_Cluster']==cid]['MHR_Index'].mean() for cid in set(fusion_df['Risk_Cluster'])}
+    sorted_clusters = sorted(cluster_means, key=lambda x: cluster_means[x], reverse=True)
+    cluster_labels = {cid: label for cid,label in zip(sorted_clusters,['HIGH','MEDIUM','LOW'])}
+    risk_level = cluster_labels[cluster_pred]
+
+    # Map Risk Level to disaster type
+    disaster_map = {'HIGH':'Earthquake','MEDIUM':'Landslide','LOW':'Flood/Climate'}
+    disaster_type = disaster_map.get(risk_level,'Unknown')
+    is_disaster = "YES" if risk_level in ['HIGH','MEDIUM'] else "NO"
+
+    df_input['Predicted_Risk_Level'] = risk_level
+    df_input['Disaster_Type'] = disaster_type
+    df_input['Is_Disaster'] = is_disaster
+    df_input.to_csv("manual_input_prediction_disaster.csv", index=False)
+
+    return risk_level, disaster_type, is_disaster
+
+# -----------------------------
+# 10) Interactive input
+# -----------------------------
+def interactive_manual_input():
+    print("\n⚡ Enter input values for hazard prediction (Earthquake/Landslide/Flood/Climate). Leave blank for optional fields.")
+    def get_float(prompt, default=0.0):
+        val = input(prompt)
+        if val.strip()=="":
+            return default
+        try:
+            return float(val)
+        except:
+            print("⚠️ Invalid input, using default:", default)
+            return default
+
+    p_arrival_sample = get_float("P-wave arrival sample: ")
+    s_arrival_sample = get_float("S-wave arrival sample: ")
+    p_travel_sec     = get_float("P-wave travel time (sec): ")
+    snr_db           = get_float("Signal-to-noise ratio (dB): ")
+    rainfall         = get_float("Rainfall (mm, optional): ")
+    temperature      = get_float("Temperature (°C, optional): ")
+    humidity         = get_float("Humidity (%RH, optional): ")
+
+    input_dict = {
+        'p_arrival_sample': p_arrival_sample,
+        's_arrival_sample': s_arrival_sample,
+        'p_travel_sec': p_travel_sec,
+        'snr_db': snr_db,
+        'rainfall': rainfall,
+        'temperature': temperature,
+        'humidity': humidity
+    }
+
+    risk_level, disaster_type, is_disaster = manual_input_predict_disaster(input_dict)
+
+    print("\n✅ Prediction Complete:")
+    print(f"Risk Level: {risk_level}")
+    print(f"Disaster Type: {disaster_type}")
+    print(f"Natural Disaster?: {is_disaster}\n")
+
+# -----------------------------
+# Run interactive input if main
+# -----------------------------
+if __name__ == "__main__":
+    interactive_manual_input()
