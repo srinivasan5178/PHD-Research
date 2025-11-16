@@ -1,0 +1,480 @@
+# ============================================================
+# Multi-Hazard Fusion + Enhanced P-wave Early Warning + Autoencoder
+# (EQ [P-wave metadata] + Flood)
+# PCA feature influence + Weighted PCA fusion + KMeans clustering
+# Train/Test Split (80:20) + Flask frontend for manual input + Metrics
+# Author: s sri | Updated for 10-input frontend & JS fix
+# ============================================================
+
+import os
+import re
+import ast
+import json
+import numpy as np
+import pandas as pd
+from scipy.signal import butter, filtfilt
+
+from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, precision_score, recall_score, f1_score, accuracy_score
+
+import tensorflow as tf
+from tensorflow.keras import layers, models, callbacks
+
+from flask import Flask, render_template_string, request, jsonify
+
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+# -----------------------------
+# File paths (modify as needed)
+# -----------------------------
+P_wave_earthquake_path = r"C:\Users\srini\Desktop\Project\Baladealgorithm\Dataset\Dataset\Dataset\Dataset_earth_land\P-wave-Eartquakes-.csv"
+flood_path             = r"C:\Users\srini\Desktop\Project\Baladealgorithm\Dataset\Dataset\Dataset\Dataset_earth_land\flood_risk_dataset_india.csv"
+
+# -----------------------------
+# Confidence / weighting parameters
+# -----------------------------
+PWEWI_WEIGHT = 2.5
+LOWFREQ_WEIGHT = 2.0
+TEMPERATURE = 0.45
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def safe_read_csv(path):
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"File not found: {path}")
+    return pd.read_csv(path)
+
+def parse_array_strings(df):
+    def parse_val(x):
+        if isinstance(x, str):
+            try:
+                txt = x.strip()
+                if txt.startswith('[') and txt.endswith(']'):
+                    try:
+                        arr = ast.literal_eval(txt)
+                    except Exception:
+                        nums = re.findall(r"[-+]?\d*\.\d+|\d+", txt)
+                        arr = [float(n) for n in nums]
+                    if isinstance(arr, (list, tuple, np.ndarray)):
+                        arr = np.array(arr, dtype=float)
+                        return float(np.mean(arr))
+                nums = re.findall(r"[-+]?\d*\.\d+|\d+", x)
+                if nums:
+                    return float(nums[0])
+                return float(txt)
+            except Exception:
+                return np.nan
+        return x
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            df[col] = df[col].apply(parse_val)
+    return df
+
+def bandpass_filter(data, lowcut, highcut, fs=250, order=4):
+    nyq = 0.5 * fs
+    low = max(lowcut / nyq, 1e-12)
+    high = min(highcut / nyq, 0.999999)
+    b, a = butter(order, [low, high], btype='band')
+    return filtfilt(b, a, data)
+
+def compute_p_wave_energy_proxy(df):
+    df = parse_array_strings(df.copy())
+    required = {'p_arrival_sample','s_arrival_sample','p_travel_sec'}
+    if not required.issubset(df.columns):
+        df['P_Wave_Energy_Proxy'] = 0.0
+        df['LowFreq_Energy'] = 0.0
+        df['P_S_gap'] = np.nan
+        return df
+
+    df['P_S_gap'] = df['s_arrival_sample'].astype(float) - df['p_arrival_sample'].astype(float)
+    snr = df['snr_db'].astype(float) if 'snr_db' in df.columns else pd.Series(np.ones(len(df)))
+    df['P_Wave_Energy_Proxy'] = (snr * df['P_S_gap']) / (df['p_travel_sec'].astype(float) + 1.0)
+
+    signal = df['snr_db'].astype(float).values if 'snr_db' in df.columns else df['p_travel_sec'].astype(float).values
+    try:
+        if len(signal) > 3:
+            filtered = bandpass_filter(signal, 0.5, 5.0, fs=250)
+            df['LowFreq_Energy'] = np.mean(filtered**2)
+        else:
+            df['LowFreq_Energy'] = np.mean(signal**2)
+    except Exception:
+        df['LowFreq_Energy'] = np.mean(signal**2)
+
+    df[['P_Wave_Energy_Proxy','LowFreq_Energy']] = df[['P_Wave_Energy_Proxy','LowFreq_Energy']].replace([np.inf,-np.inf],0).fillna(0)
+    return df
+
+def safe_clean_numeric_dataframe(df, name):
+    df = df.copy()
+    df = parse_array_strings(df)
+    for c in df.columns:
+        if not pd.api.types.is_numeric_dtype(df[c]):
+            df[c] = pd.to_numeric(df[c], errors='coerce')
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    for c in df.columns:
+        df[c] = df[c].fillna(df[c].mean() if not df[c].isna().all() else 0.0)
+    print(f"✅ Cleaned {name} numeric ({df.shape[1]} cols, {df.shape[0]} rows)")
+    return df
+
+def run_pca_safe(df, n_components=3):
+    if df.shape[1]==0 or df.shape[0]==0:
+        return None, np.zeros((df.shape[0], min(n_components,1)))
+    scaler = StandardScaler()
+    X = scaler.fit_transform(df)
+    n_comp = min(n_components, X.shape[1])
+    pca = PCA(n_components=n_comp)
+    Xp = pca.fit_transform(X)
+    if Xp.shape[1] < 2:
+        Xp = np.hstack([Xp, np.zeros((Xp.shape[0], 2 - Xp.shape[1]))])
+    return pca, Xp
+
+# -----------------------------
+# Load datasets
+# -----------------------------
+print("Loading datasets...")
+df_pw = safe_read_csv(P_wave_earthquake_path)
+df_fl = safe_read_csv(flood_path)
+print("✅ Datasets loaded")
+
+df_pw = compute_p_wave_energy_proxy(df_pw)
+vals = np.array(df_pw['P_Wave_Energy_Proxy'].astype(float).values).reshape(-1,1)
+df_pw['PWEWI'] = 0.0 if np.nanstd(vals)==0 else StandardScaler().fit_transform(vals).ravel()
+
+# Numeric cleaning
+eq_num = safe_clean_numeric_dataframe(df_pw.select_dtypes(include=[np.number]), 'EQ')
+fl_num = safe_clean_numeric_dataframe(df_fl.select_dtypes(include=[np.number]), 'FL')
+if 'PWEWI' not in eq_num.columns:
+    eq_num['PWEWI'] = df_pw['PWEWI']
+
+# PCA
+pca_eq, eq_pca = run_pca_safe(eq_num, 3)
+pca_fl, fl_pca = run_pca_safe(fl_num, 3)
+
+# Fusion
+n = min(eq_pca.shape[0], fl_pca.shape[0])
+fusion_mat = np.hstack([eq_pca[:n,:2], fl_pca[:n,:2]])
+fusion_cols = ['EQ_PC1','EQ_PC2','FL_PC1','FL_PC2']
+fusion_df = pd.DataFrame(fusion_mat, columns=fusion_cols)
+fusion_df['PWEWI'] = df_pw['PWEWI'].reset_index(drop=True)[:n].fillna(0.0)
+fusion_df['LowFreq_Energy'] = df_pw['LowFreq_Energy'].reset_index(drop=True)[:n].fillna(0.0)
+
+# Weighted features
+fusion_df['PWEWI_w'] = fusion_df['PWEWI'] * PWEWI_WEIGHT
+fusion_df['LowFreq_Energy_w'] = fusion_df['LowFreq_Energy'] * LOWFREQ_WEIGHT
+ae_features = fusion_cols + ['PWEWI_w','LowFreq_Energy_w']
+
+# -----------------------------
+# Train/Test Split (80:20)
+# -----------------------------
+X_features = fusion_df[ae_features].values
+y_labels   = fusion_df['PWEWI'].apply(lambda x: 'HIGH' if x>np.percentile(fusion_df['PWEWI'],66) else ('MEDIUM' if x>np.percentile(fusion_df['PWEWI'],33) else 'LOW')).values
+
+X_train, X_test, y_train, y_test, idx_train, idx_test = train_test_split(
+    X_features, y_labels, fusion_df.index, test_size=0.3, random_state=42, stratify=y_labels
+)
+
+# KMeans on training set
+kmeans_train = KMeans(n_clusters=3, random_state=42, n_init=500, max_iter=900)
+kmeans_train.fit(X_train)
+train_clusters = kmeans_train.labels_
+
+# Map clusters -> risk labels
+train_df = fusion_df.loc[idx_train].copy()
+train_df['Risk_Cluster'] = train_clusters
+train_df['MHR_Index'] = train_df[fusion_cols + ['PWEWI','LowFreq_Energy']].mean(axis=1)
+cluster_means_train = train_df.groupby('Risk_Cluster')['MHR_Index'].mean().sort_values(ascending=False)
+cluster_to_label_train = {int(cid): label for cid,label in zip(cluster_means_train.index,['HIGH','MEDIUM','LOW'])}
+
+# Predict on train and test
+y_train_pred = np.array([cluster_to_label_train[c] for c in train_clusters])
+test_clusters = kmeans_train.predict(X_test)
+y_test_pred = np.array([cluster_to_label_train.get(c,'LOW') for c in test_clusters])
+
+# -----------------------------
+# Metrics
+# -----------------------------
+metrics_report_test = classification_report(y_test, y_test_pred, digits=4)
+precision_w = precision_score(y_test, y_test_pred, average='weighted')
+recall_w    = recall_score(y_test, y_test_pred, average='weighted')
+f1_w        = f1_score(y_test, y_test_pred, average='weighted')
+accuracy    = accuracy_score(y_test, y_test_pred)
+print("📊 Test Set Metrics:")
+print(metrics_report_test)
+print(f"Weighted Precision : {precision_w:.4f}")
+print(f"Weighted Recall    : {recall_w:.4f}")
+print(f"Weighted F1-score  : {f1_w:.4f}")
+print(f"Overall Accuracy   : {accuracy:.4f}")
+
+# -----------------------------
+# Autoencoder
+# -----------------------------
+ae_features_ae = fusion_cols + ['PWEWI','LowFreq_Energy']
+X = fusion_df[ae_features_ae].values
+ae_scaler = MinMaxScaler()
+X_scaled = ae_scaler.fit_transform(X)
+n_train = max(1,int(0.8*len(X_scaled)))
+X_train_ae, X_val_ae = X_scaled[:n_train], X_scaled[n_train:] if n_train < len(X_scaled) else (X_scaled, X_scaled)
+
+input_dim = X_train_ae.shape[1]
+encoding_dim = max(2, input_dim // 3)
+ae_input = layers.Input(shape=(input_dim,))
+encoded = layers.Dense(encoding_dim*2, activation='relu')(ae_input)
+encoded = layers.Dense(encoding_dim, activation='relu')(encoded)
+decoded = layers.Dense(encoding_dim*2, activation='relu')(encoded)
+decoded = layers.Dense(input_dim, activation='linear')(decoded)
+ae = models.Model(ae_input, decoded)
+ae.compile(optimizer='adam', loss='mse')
+es = callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True)
+ae.fit(X_train_ae, X_train_ae, validation_data=(X_val_ae,X_val_ae), epochs=50, batch_size=32, callbacks=[es], verbose=0)
+
+X_pred = ae.predict(X_scaled)
+recon_err = np.mean((X_scaled - X_pred)**2, axis=1)
+val_pred = ae.predict(X_val_ae)
+val_err = np.mean((X_val_ae - val_pred)**2, axis=1)
+ae_threshold = np.mean(val_err) + 3*np.std(val_err) if len(val_err)>0 else np.mean(recon_err)+3*np.std(recon_err)
+fusion_df['AE_Reconstruction_Error'] = recon_err
+fusion_df['AE_Anomaly'] = fusion_df['AE_Reconstruction_Error']>ae_threshold
+fusion_df.to_csv("multi_hazard_fusion_with_autoencoder.csv", index=False)
+print("✅ Fusion + autoencoder saved to multi_hazard_fusion_with_autoencoder.csv")
+
+# -----------------------------
+# Scaler for confidence calculation
+# -----------------------------
+scaler_conf = StandardScaler().fit(fusion_df[ae_features])
+
+# -----------------------------
+# Manual input prediction
+# -----------------------------
+def manual_input_predict_disaster(input_dict):
+    df_input = pd.DataFrame([input_dict])
+    df_input = compute_p_wave_energy_proxy(df_input)
+    df_numeric = safe_clean_numeric_dataframe(df_input.select_dtypes(include=[np.number]), 'Manual Input')
+
+    def align_cols(df, all_cols):
+        for c in all_cols:
+            if c not in df.columns:
+                df[c] = 0.0
+        return df[all_cols]
+
+    eq_input = align_cols(df_numeric, eq_num.columns)
+    fl_input = align_cols(df_numeric, fl_num.columns)
+
+    pcs = []
+    for pca, df_sub in zip([pca_eq, pca_fl], [eq_input, fl_input]):
+        if pca is not None and df_sub.shape[1]>0:
+            try:
+                X_scaled_local = StandardScaler().fit_transform(df_sub.values)
+                Xp = pca.transform(X_scaled_local)
+            except Exception:
+                Xp = np.zeros((df_sub.shape[0], 2))
+            if Xp.shape[1]<2:
+                Xp = np.hstack([Xp, np.zeros((Xp.shape[0], 2 - Xp.shape[1]))])
+        else:
+            Xp = np.zeros((df_sub.shape[0],2))
+        pcs.append(Xp[:, :2])
+
+    if 'PWEWI' not in df_input.columns:
+        df_input['PWEWI'] = df_input.get('P_Wave_Energy_Proxy', pd.Series([0.0]))
+    if 'LowFreq_Energy' not in df_input.columns:
+        df_input['LowFreq_Energy'] = 0.0
+
+    fusion_raw = np.hstack(pcs + [df_input[['PWEWI','LowFreq_Energy']].values])
+    df_fusion_raw = pd.DataFrame(fusion_raw, columns=fusion_cols + ['PWEWI','LowFreq_Energy'])
+    df_fusion = df_fusion_raw.copy()
+    df_fusion['PWEWI_w'] = df_fusion['PWEWI']*PWEWI_WEIGHT
+    df_fusion['LowFreq_Energy_w'] = df_fusion['LowFreq_Energy']*LOWFREQ_WEIGHT
+
+    try:
+        cluster_pred = int(kmeans_train.predict(df_fusion[ae_features])[0])
+    except:
+        cluster_pred = 0
+
+    try:
+        centers = kmeans_train.cluster_centers_
+        centers_scaled = scaler_conf.transform(centers)
+        point_scaled = scaler_conf.transform(df_fusion[ae_features].values.reshape(1,-1))
+        dists = np.linalg.norm(point_scaled - centers_scaled, axis=1)
+        T = float(TEMPERATURE)
+        scores = -dists / T
+        exp_scores = np.exp(scores - np.max(scores))
+        conf_scores = exp_scores/np.sum(exp_scores) if np.sum(exp_scores)!=0 else np.ones_like(exp_scores)/len(exp_scores)
+        confidence = float(conf_scores[cluster_pred])
+    except:
+        confidence = 0.0
+
+    risk_level = cluster_to_label_train.get(cluster_pred, 'LOW')
+    disaster_map = {'HIGH':'Earthquake','MEDIUM':'Flood','LOW':'Earthquake/Flood'}
+    disaster_type = disaster_map.get(risk_level,'Unknown')
+    is_disaster = "YES" if risk_level in ['HIGH','MEDIUM'] else "NO"
+
+    PWEWI_val = float(df_fusion_raw['PWEWI'].values[0])
+    LowFreq_val = float(df_fusion_raw['LowFreq_Energy'].values[0])
+    rainfall_val = float(df_input.get('rainfall', pd.Series([0.0])).values[0])
+
+    return risk_level, disaster_type, is_disaster, PWEWI_val, LowFreq_val, rainfall_val, confidence
+
+# -----------------------------
+# Flask App
+# -----------------------------
+app = Flask(__name__)
+HTML_TEMPLATE = f"""
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Multi-Hazard Disaster Prediction</title>
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+<style>
+body {{
+    background: #f5f7fa;
+    font-family: 'Segoe UI', sans-serif;
+}}
+h2 {{
+    color: #0d6efd;
+    font-weight: bold;
+}}
+.card {{
+    border-radius: 1rem;
+    box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+}}
+.form-label {{
+    font-weight: 600;
+}}
+#result {{
+    font-size: 1.1rem;
+    font-weight: bold;
+    padding: 15px;
+    border-radius: 0.5rem;
+}}
+.badge-high {{
+    background-color: #dc3545;
+    color: white;
+}}
+.badge-medium {{
+    background-color: #fd7e14;
+    color: white;
+}}
+.badge-low {{
+    background-color: #28a745;
+    color: white;
+}}
+</style>
+</head>
+<body>
+<div class="container mt-5 mb-5">
+<h2 class="mb-4 text-center">🌐 Multi-Hazard Disaster Prediction</h2>
+
+<div class="card mb-4 p-4">
+<h4 class="mb-3">Model Test Accuracy Metrics</h4>
+<div class="row">
+    <div class="col-md-3 col-6 mb-2"><div class="p-3 bg-light rounded text-center">Accuracy<br><b>{accuracy:.4f}</b></div></div>
+    <div class="col-md-3 col-6 mb-2"><div class="p-3 bg-light rounded text-center">Weighted Precision<br><b>{precision_w:.4f}</b></div></div>
+    <div class="col-md-3 col-6 mb-2"><div class="p-3 bg-light rounded text-center">Weighted Recall<br><b>{recall_w:.4f}</b></div></div>
+    <div class="col-md-3 col-6 mb-2"><div class="p-3 bg-light rounded text-center">Weighted F1-score<br><b>{f1_w:.4f}</b></div></div>
+</div>
+</div>
+
+<div class="card p-4 mb-4">
+<h4 class="mb-3">Manual Prediction Input</h4>
+<form id="predictForm">
+<div class="row">
+<div class="col-md-6 mb-3">
+    <label class="form-label">P Arrival Sample</label>
+    <input type="number" step="any" class="form-control" id="p_arrival_sample" required>
+</div>
+<div class="col-md-6 mb-3">
+    <label class="form-label">S Arrival Sample</label>
+    <input type="number" step="any" class="form-control" id="s_arrival_sample" required>
+</div>
+<div class="col-md-6 mb-3">
+    <label class="form-label">P Travel Time (sec)</label>
+    <input type="number" step="any" class="form-control" id="p_travel_sec" required>
+</div>
+<div class="col-md-6 mb-3">
+    <label class="form-label">SNR (dB)</label>
+    <input type="number" step="any" class="form-control" id="snr_db" required>
+</div>
+<div class="col-md-6 mb-3">
+    <label class="form-label">Rainfall</label>
+    <input type="number" step="any" class="form-control" id="rainfall" required>
+</div>
+</div>
+<button type="submit" class="btn btn-primary w-100 mt-3">Predict Disaster</button>
+</form>
+<div class="mt-4" id="result"></div>
+</div>
+</div>
+
+<script>
+function riskBadge(level) {{
+    if(level === 'HIGH') return '<span class="badge badge-high">HIGH</span>';
+    if(level === 'MEDIUM') return '<span class="badge badge-medium">MEDIUM</span>';
+    return '<span class="badge badge-low">LOW</span>';
+}}
+
+document.getElementById('predictForm').addEventListener('submit', async function(e) {{
+    e.preventDefault();
+    let data = {{
+        p_arrival_sample: parseFloat(document.getElementById('p_arrival_sample').value),
+        s_arrival_sample: parseFloat(document.getElementById('s_arrival_sample').value),
+        p_travel_sec: parseFloat(document.getElementById('p_travel_sec').value),
+        snr_db: parseFloat(document.getElementById('snr_db').value),
+        rainfall: parseFloat(document.getElementById('rainfall').value)
+    }};
+    try {{
+        const resp = await axios.post('/predict', data);
+        const r = resp.data;
+        if(r.error) {{
+            document.getElementById('result').innerHTML = '<span class="text-danger">Error: ' + r.error + '</span>';
+        }} else {{
+            document.getElementById('result').innerHTML = `
+                <div class="alert alert-info">
+                    <b>Risk Level:</b> ${{
+                        riskBadge(r.risk_level)
+                    }}<br>
+                    <b>Disaster Type:</b> ${{r.disaster_type}}<br>
+                    <b>Disaster?</b> ${{r.is_disaster}}<br>
+                    <b>Confidence:</b> ${{r.confidence.toFixed(4)}}
+                </div>`;
+        }}
+    }} catch(err) {{
+        document.getElementById('result').innerHTML = '<span class="text-danger">Request Failed</span>';
+    }}
+}});
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/")
+def home():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route("/predict", methods=["POST"])
+def predict():
+    try:
+        data = request.json
+        risk_level, disaster_type, is_disaster, PWEWI_val, LowFreq_val, rainfall_val, confidence = manual_input_predict_disaster(data)
+        response = {
+            "risk_level": risk_level,
+            "disaster_type": disaster_type,
+            "is_disaster": is_disaster,
+            "PWEWI": PWEWI_val,
+            "LowFreq_Energy": LowFreq_val,
+            "rainfall": rainfall_val,
+            "confidence": confidence
+        }
+        return jsonify(response)
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+# -----------------------------
+# Run App
+# -----------------------------
+if __name__ == "__main__":
+    app.run(debug=True)
